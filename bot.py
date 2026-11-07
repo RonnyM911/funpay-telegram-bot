@@ -923,6 +923,10 @@ def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False
     week_stats = _bucket(week)
     today_stats = _bucket([o for o in week
                            if (ts := _order_paid_ts(o)) is not None and ts >= midnight])
+    # скользящие сутки: «за сегодня» после полуночи не обнуляется скачком
+    day_ago_ts = time.time() - 24 * 3600
+    last24_stats = _bucket([o for o in week
+                            if (ts := _order_paid_ts(o)) is not None and ts >= day_ago_ts])
 
     # все неподтверждённые сейчас, независимо от даты
     pending = []
@@ -960,6 +964,7 @@ def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False
     return {
         "balance": balance,
         "today": today_stats,
+        "last24": last24_stats,
         "week": week_stats,
         "buyers_total": len(buyers),
         "top_buyer": max(buyers.items(), key=lambda kv: kv[1]) if buyers else None,
@@ -1104,6 +1109,7 @@ def stats_text(s: dict) -> str:
     else:
         lines.append("💰 Баланс: <i>недоступен</i>")
     td, wk = s["today"], s["week"]
+    l24 = s.get("last24") or _bucket([])
     lines += [
         "",
         "📦 <b>Заказы за сегодня</b> (с 00:00):",
@@ -1116,6 +1122,11 @@ def stats_text(s: dict) -> str:
     lines.append(f"• Выручка за день: <b>{fmt_price(td['revenue'])}₽</b>")
     if td["sold"]:
         lines.append(f"• Средний чек: <b>{fmt_price(td['revenue'] / td['sold'])}₽</b>")
+    lines += [
+        "",
+        "🕒 <b>За последние 24 часа</b> (без обнуления в полночь):",
+        f"• Всего: <b>{l24['total']}</b> — выручка: <b>{fmt_price(l24['revenue'])}₽</b>",
+    ]
 
     week_line = (f"• Всего: <b>{wk['total']}</b> — ✅ {wk['closed']}, "
                  f"⏳ {wk['paid']}, ↩️ {wk['refunded']}")
