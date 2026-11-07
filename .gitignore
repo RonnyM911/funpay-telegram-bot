@@ -1,0 +1,10 @@
+# Секреты и локальные данные — НИКОГДА не коммитить
+.env
+*.session
+*.session-journal
+bot.lock
+reminders.json
+bans.json
+logs/
+__pycache__/
+*.pyc

@@ -1,0 +1,4 @@
+FunPayAPI
+telethon>=1.36
+TelethonFakeTLS
+python-dotenv
