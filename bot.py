@@ -91,6 +91,12 @@ REMINDER_INTERVAL_HOURS = float(os.getenv("REMINDER_INTERVAL_HOURS", "4"))
 SUPPORT_CONFIRM_HOURS = float(os.getenv("SUPPORT_CONFIRM_HOURS", "24"))
 # Как часто (в минутах) проверять: не перевалил ли какой-то заказ за срок
 SUPPORT_CHECK_MINUTES = float(os.getenv("SUPPORT_CHECK_MINUTES", "10"))
+
+# Автоподнятие лотов («Поднять» на FunPay): раз в RAISE_INTERVAL_MINUTES минут
+# бот поднимает все лоты, у которых вышел кулдаун площадки (~4 ч на лот,
+# RAISE_COOLDOWN_HOURS защищает от лишних запросов). 0 = выключить.
+RAISE_INTERVAL_MINUTES = float(os.getenv("RAISE_INTERVAL_MINUTES", "20"))
+RAISE_COOLDOWN_HOURS = float(os.getenv("RAISE_COOLDOWN_HOURS", "3.83"))
 # {order} — номер заказа, {buyer} — ник покупателя, {hours} — срок в часах
 SUPPORT_TEXT = os.getenv(
     "SUPPORT_TEXT",
@@ -836,6 +842,167 @@ async def support_loop():
             log.exception("Ошибка цикла заявок в поддержку")
             await asyncio.sleep(60)
         await asyncio.sleep(SUPPORT_CHECK_MINUTES * 60)
+
+
+# ---------------------------------------------------------------------------- #
+#                          Автоподнятие лотов                                   #
+# ---------------------------------------------------------------------------- #
+# На FunPay кнопка «Поднять предложения» — одна на раздел (js-lot-raise,
+# data-game / data-node), шлёт POST /lots/raise {game_id, node_id}.
+# Кулдаун — на раздел целиком; FunPay в ответе сообщает unlock_at — бот
+# планирует следующий подъём точно к этому моменту.
+
+_raise_session = None  # requests.Session | None
+_raise_node_unlock: dict[int, float] = {}  # node -> ts, когда раздел можно поднять
+_raise_last_cycle: dict = {}               # {"ts", "raised", "on_cooldown", "total"}
+
+
+def _raise_session_get() -> "_requests.Session":
+    global _raise_session
+    if _raise_session is None:
+        _raise_session = _requests.Session()
+        _raise_session.headers.update(
+            {"user-agent": USER_AGENT or DEFAULT_UA, "accept": "text/html"})
+        _raise_session.cookies.set("golden_key", acc.golden_key, domain="funpay.com")
+    return _raise_session
+
+
+def _collect_raise_nodes() -> list[tuple[int, int]]:
+    """Профиль -> каждый раздел с лотами -> (game_id, node)."""
+    out = []
+    try:
+        s = _raise_session_get()
+        r = s.get(f"https://funpay.com/users/{acc.id}/", timeout=25)
+        h = r.text
+        nodes = sorted({int(n) for n in re.findall(r'funpay\.com/lots/(\d+)/trade"', h)})
+    except Exception:
+        return out
+    for node in nodes:
+        try:
+            rr = s.get(f"https://funpay.com/lots/{node}/trade", timeout=25)
+            m = re.search(r'js-lot-raise"[^>]*data-game="(\d+)"', rr.text)
+            if m:
+                out.append((int(m.group(1)), node))
+        except Exception as e:
+            log.warning("Автоподъём: не удалось прочитать раздел %s: %s", node, e)
+        time.sleep(0.5)
+    return out
+
+
+def _raise_node(game_id: int, node: int) -> tuple[bool, str, float]:
+    """POST /lots/raise {game_id, node_id} — поднять все предложения раздела.
+    Возвращает (успех, msg, wait_ts): wait_ts — когда можно пробовать снова."""
+    s = _raise_session_get()
+    r = s.post("https://funpay.com/lots/raise",
+               data={"game_id": game_id, "node_id": node, "node_ids[]": node},
+               headers={"x-requested-with": "XMLHttpRequest",
+                        "accept": "application/json, text/javascript, */*; q=0.01",
+                        "referer": f"https://funpay.com/lots/{node}/trade"},
+               timeout=25)
+    try:
+        j = r.json()
+    except Exception:
+        return True, "", time.time() + RAISE_COOLDOWN_HOURS * 3600
+    wait_ts = 0.0
+    if isinstance(j, dict) and j.get("unlock_at"):
+        try:
+            from datetime import datetime as _dt
+            wait_ts = _dt.strptime(j["unlock_at"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except Exception:
+            wait_ts = time.time() + float(j.get("wait") or RAISE_COOLDOWN_HOURS * 3600)
+    msg = str(j.get("msg") or "")[:120] if isinstance(j, dict) else ""
+    if isinstance(j, dict) and j.get("error"):
+        return False, msg or "кукдаун", wait_ts or time.time() + RAISE_COOLDOWN_HOURS * 3600
+    return True, msg, wait_ts or time.time() + RAISE_COOLDOWN_HOURS * 3600
+
+
+def raise_all_lots() -> tuple[int, int, int]:
+    """Поднимает предложения во всех разделах, у которых вышел кулдаун.
+    Возвращает (поднято, на кулдауне, всего)."""
+    now = time.time()
+    nodes = _collect_raise_nodes()
+    raised = on_cooldown = total = 0
+    changed = False
+    for game_id, node in nodes:
+        total += 1
+        if now < _raise_node_unlock.get(node, 0):
+            on_cooldown += 1
+            continue
+        try:
+            ok, msg, wait_ts = _raise_node(game_id, node)
+        except Exception as e:
+            log.warning("Автоподъём раздела %s: запрос не прошёл: %s", node, e)
+            continue
+        _raise_node_unlock[node] = wait_ts
+        reminders_last[f"raise_node:{node}"] = wait_ts
+        changed = True
+        if ok:
+            raised += 1
+            log.info("Раздел %s: предложения подняты%s", node, f" ({msg})" if msg else "")
+        else:
+            log.info("Раздел %s: подъём отклонён: %s (следующий в %s)",
+                     node, msg,
+                     datetime.datetime.fromtimestamp(wait_ts, SAMARA_TZ).strftime("%H:%M"))
+        time.sleep(1.0)
+    if changed:
+        _save_reminders()
+    return raised, on_cooldown, total
+
+
+async def raise_loop():
+    """Цикл автоподъёма: раз в RAISE_INTERVAL_MINUTES минут поднимает
+    предложения во всех разделах, у которых вышел кулдаун (по unlock_at от
+    FunPay). 0 = выключено."""
+    if RAISE_INTERVAL_MINUTES <= 0:
+        log.info("Автоподнятие лотов отключено (RAISE_INTERVAL_MINUTES=0)")
+        return
+    await asyncio.to_thread(_load_reminders)
+    for k, v in reminders_last.items():
+        if k.startswith("raise_node:") and k.split(":", 1)[1].isdigit():
+            _raise_node_unlock[int(k.split(":", 1)[1])] = float(v)
+    log.info("Автоподнятие лотов: цикл каждые %.0f мин, кулдаун %.1f ч",
+             RAISE_INTERVAL_MINUTES, RAISE_COOLDOWN_HOURS)
+    await asyncio.sleep(120)  # дать Runner'у спокойно стартовать
+    while True:
+        try:
+            raised, on_cd, total = await asyncio.to_thread(raise_all_lots)
+            _raise_last_cycle.update({
+                "ts": time.time(), "raised": raised,
+                "on_cooldown": on_cd, "total": total,
+            })
+            log.info("Подъём лотов: поднято %d, на кулдауне %d, всего %d",
+                     raised, on_cd, total)
+        except Exception:
+            log.exception("Ошибка цикла автоподъёма")
+        await asyncio.sleep(max(5.0, RAISE_INTERVAL_MINUTES * 60))
+
+
+async def raise_loop():
+    """Цикл автоподъёма: раз в RAISE_INTERVAL_MINUTES минут поднимает все лоты,
+    у которых вышел кулдаун. 0 = выключено."""
+    if RAISE_INTERVAL_MINUTES <= 0:
+        log.info("Автоподнятие лотов отключено (RAISE_INTERVAL_MINUTES=0)")
+        return
+    await asyncio.to_thread(_load_reminders)
+    for k, v in reminders_last.items():
+        if k.startswith("raise:") and k.split(":", 1)[1].isdigit():
+            _raise_last_ok[int(k.split(":", 1)[1])] = float(v)
+    log.info("Автоподнятие лотов: цикл каждые %.0f мин, кулдаун %.1f ч",
+             RAISE_INTERVAL_MINUTES, RAISE_COOLDOWN_HOURS)
+    await asyncio.sleep(120)  # дать Runner'у спокойно стартовать
+    while True:
+        try:
+            raised, on_cd, total = await asyncio.to_thread(raise_all_lots)
+            _raise_last_cycle.update({
+                "ts": time.time(), "raised": raised,
+                "on_cooldown": on_cd, "total": total,
+            })
+            log.info("Подъём лотов: поднято %d, на кулдауне %d, всего %d",
+                     raised, on_cd, total)
+        except Exception:
+            log.exception("Ошибка цикла автоподъёма")
+        await asyncio.sleep(max(5.0, RAISE_INTERVAL_MINUTES * 60))
 
 
 def send_funpay_message(chat_id: int, text: str):
@@ -2044,11 +2211,22 @@ async def on_tg_message(event):
             proxy_desc = f"{len(TG_MTPROXY.split(';'))} шт."
         else:
             proxy_desc = "напрямую"
+        raise_line = "выключен (RAISE_INTERVAL_MINUTES=0)"
+        if RAISE_INTERVAL_MINUTES > 0:
+            if _raise_last_cycle:
+                cts = datetime.datetime.fromtimestamp(
+                    _raise_last_cycle["ts"], SAMARA_TZ).strftime("%H:%M")
+                raise_line = (f"🟢 каждые {RAISE_INTERVAL_MINUTES:.0f} мин — последний цикл "
+                              f"{cts} (поднято {_raise_last_cycle['raised']}/"
+                              f"{_raise_last_cycle['total']})")
+            else:
+                raise_line = f"🟢 каждые {RAISE_INTERVAL_MINUTES:.0f} мин — первый цикл через ~2 мин"
         await event.reply(
             "📊 <b>Статус</b>\n"
             f"FunPay аккаунт: {'🟢 ' + esc(acc.username) if ok else '🔴 не подключён'}\n"
             f"Опрос FunPay: {'🟢 работает' if runner_ok else '🔴 остановлен'}\n"
             f"Интервал опроса: {REQUESTS_DELAY} сек\n"
+            f"Автоподнятие лотов: {raise_line}\n"
             f"MTProto-прокси: {proxy_desc}",
             buttons=ui_row(),
         )
@@ -2900,6 +3078,9 @@ async def main():
 
     # Быстрая проверка: заказ перевалил за SUPPORT_CONFIRM_HOURS — тикет сразу
     asyncio.create_task(support_loop())
+
+    # Автоподнятие лотов (кнопка «Поднять» по кулдауну)
+    asyncio.create_task(raise_loop())
 
     log.info("Подключаюсь к Telegram (MTProto)...")
     sweep_task = None
