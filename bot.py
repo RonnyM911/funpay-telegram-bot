@@ -1031,15 +1031,20 @@ def _get_balance_safe():
 
 
 def collect_stats() -> dict:
-    """Баланс + заказы за сегодня и за 7 дней + все неподтверждённые.
+    """Баланс + заказы за сегодня, 7 дней, неделю и месяц + неподтверждённые.
     Блокирующая — вызывать в отдельном потоке."""
     balance = _get_balance_safe()
 
-    midnight = datetime.datetime.now(SAMARA_TZ).replace(
-        hour=0, minute=0, second=0, microsecond=0).timestamp()
+    now_sam = datetime.datetime.now(SAMARA_TZ)
+    midnight = now_sam.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    # начало календарной недели (понедельник 00:00 по Самаре)
+    cal_week = (now_sam.replace(hour=0, minute=0, second=0, microsecond=0)
+                - datetime.timedelta(days=now_sam.weekday())).timestamp()
+    # начало календарного месяца (1-е число 00:00 по Самаре)
+    cal_month = now_sam.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
     week_start = time.time() - 7 * 24 * 3600
 
-    week: list = []
+    month: list = []
     early_stop = False
     next_from = None
     for _ in range(25):  # предохранитель от бесконечной пагинации
@@ -1049,10 +1054,10 @@ def collect_stats() -> dict:
         older = False
         for o in batch:
             ts = _order_paid_ts(o)
-            if ts is not None and ts >= week_start:
-                week.append(o)
+            if ts is not None and ts >= cal_month:
+                month.append(o)
             elif ts is not None:
-                # список идёт от свежих к старым — дальше все старше недели
+                # список идёт от свежих к старым — дальше все старше месяца
                 older = True
         if older:
             break
@@ -1062,7 +1067,8 @@ def collect_stats() -> dict:
     else:
         early_stop = True  # упёрлись в лимит страниц, а данные ещё есть
 
-    return _finish_stats(balance, week, midnight, early_stop)
+    return _finish_stats(balance, month, midnight, early_stop,
+                         cal_week=cal_week, cal_month=cal_month)
 
 
 def _bucket(orders: list) -> dict:
@@ -1086,8 +1092,15 @@ def _bucket(orders: list) -> dict:
     }
 
 
-def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False) -> dict:
-    week_stats = _bucket(week)
+def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False,
+                  cal_week: float = 0.0, cal_month: float = 0.0) -> dict:
+    month_stats = _bucket(week)
+    week_stats = _bucket([o for o in week
+                          if (ts := _order_paid_ts(o)) is not None
+                          and ts >= time.time() - 7 * 24 * 3600])
+    cal_week_stats = _bucket([o for o in week
+                              if (ts := _order_paid_ts(o)) is not None and ts >= cal_week])
+    cal_month_stats = _bucket(week)
     today_stats = _bucket([o for o in week
                            if (ts := _order_paid_ts(o)) is not None and ts >= midnight])
     # скользящие сутки: «за сегодня» после полуночи не обнуляется скачком
@@ -1117,7 +1130,7 @@ def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False
         if pending_due is None or due < pending_due:
             pending_due = due
 
-    # покупатели и рекорды за неделю
+    # покупатели и рекорды за месяц
     buyers: dict[str, int] = {}
     top_sale = None  # (цена, описание)
     for o in week:
@@ -1133,6 +1146,8 @@ def _finish_stats(balance, week: list, midnight: float, early_stop: bool = False
         "today": today_stats,
         "last24": last24_stats,
         "week": week_stats,
+        "cal_week": cal_week_stats,
+        "month": cal_month_stats,
         "buyers_total": len(buyers),
         "top_buyer": max(buyers.items(), key=lambda kv: kv[1]) if buyers else None,
         "top_sale": top_sale,
@@ -1299,12 +1314,30 @@ def stats_text(s: dict) -> str:
                  f"⏳ {wk['paid']}, ↩️ {wk['refunded']}")
     lines += [
         "",
-        "📅 <b>За 7 дней</b>:",
+        "📅 <b>За 7 дней</b> (скользящее окно):",
         week_line,
         f"• Выручка: <b>{fmt_price(wk['revenue'])}₽</b>",
     ]
     if wk["sold"]:
         lines.append(f"• Средний чек: <b>{fmt_price(wk['revenue'] / wk['sold'])}₽</b>")
+
+    cw, cm = s.get("cal_week") or _bucket([]), s.get("month") or _bucket([])
+    cw_line = (f"• Всего: <b>{cw['total']}</b> — ✅ {cw['closed']}, "
+               f"⏳ {cw['paid']}, ↩️ {cw['refunded']}")
+    lines += [
+        "",
+        "🗓 <b>За эту неделю</b> (с понедельника, обнуляется в пн):",
+        cw_line,
+        f"• Выручка: <b>{fmt_price(cw['revenue'])}₽</b>",
+    ]
+    cm_line = (f"• Всего: <b>{cm['total']}</b> — ✅ {cm['closed']}, "
+               f"⏳ {cm['paid']}, ↩️ {cm['refunded']}")
+    lines += [
+        "",
+        "📆 <b>За этот месяц</b> (с 1 числа, обнуляется 1-го):",
+        cm_line,
+        f"• Выручка: <b>{fmt_price(cm['revenue'])}₽</b>",
+    ]
     if s.get("top_buyer"):
         tb, cnt = s["top_buyer"]
         lines.append(f"• Покупателей: <b>{s['buyers_total']}</b> — самый активный: "
