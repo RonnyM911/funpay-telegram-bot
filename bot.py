@@ -350,12 +350,50 @@ def _parse_msg_html(raw_html: str) -> tuple[str | None, str | None]:
 def patch_account_parsers(acc: Account):
     bot_char = getattr(acc, "_Account__bot_character", "⁤")
 
-    def patched_get_chats_histories(chats_data: dict) -> dict:
+    def _fetch_chat_node(chat_id: int, chat_name: str | None, last_id: int) -> tuple[list, list | None]:
         headers = {
             "accept": "*/*",
             "content-type": "application/x-www-form-urlencoded; charset=UTF-8",
             "x-requested-with": "XMLHttpRequest",
         }
+        objects = [{"type": "chat_node", "id": chat_id, "tag": "00000000",
+                    "data": {"node": chat_id, "last_message": last_id, "content": ""}}]
+        payload = {"objects": json.dumps(objects), "request": False, "csrf_token": acc.csrf_token}
+        response = acc.method("post", "runner/", headers, payload, raise_not_200=True)
+        json_response = response.json()
+        data = None
+        for obj in json_response.get("objects") or []:
+            if obj.get("type") == "chat_node":
+                data = obj.get("data")
+                break
+        messages_raw = data["messages"] if (data is not None and data.get("messages") is not None) else None
+
+        messages = []
+        prev_author_name, prev_author_id = chat_name, None
+        for m in messages_raw or []:
+            raw_html = m.get("html") or ""
+            soup = BeautifulSoup(raw_html, "html.parser")
+            text, img_link = _parse_msg_html(raw_html)
+            if text and text.startswith(bot_char):
+                text = text.replace(bot_char, "", 1)  # невидимый префикс бота
+            author_id = int(m.get("author") or 0)
+            author_link = soup.find("a", {"class": "chat-msg-author-link"})
+            if author_link is not None:
+                author_name = author_link.text  # у сообщения есть "шапка"
+            elif author_id == acc.id:
+                author_name = acc.username
+            elif prev_author_id == author_id:
+                author_name = prev_author_name  # продолжение серии сообщений
+            else:
+                author_name = chat_name if chat_name else str(author_id or "?")
+            prev_author_name, prev_author_id = author_name, author_id
+            messages.append(types.Message(
+                int(m.get("id") or 0), text, chat_id, chat_name,
+                author_name, author_id, raw_html, img_link,
+            ))
+        return messages, messages_raw
+
+    def patched_get_chats_histories(chats_data: dict) -> dict:
         result = {}
         # Каждый чат — отдельным POST-ом, с last_message = ID последнего
         # известного сообщения (как у актуальных клиентов FunPay). Пустой
@@ -363,50 +401,16 @@ def patch_account_parsers(acc: Account):
         for chat_id in chats_data:
             chat_name = chats_data.get(chat_id)
             last_id = node_last_ids.get(chat_id, -1)
-            objects = [{"type": "chat_node", "id": chat_id, "tag": "00000000",
-                        "data": {"node": chat_id, "last_message": last_id, "content": ""}}]
-            payload = {"objects": json.dumps(objects), "request": False, "csrf_token": acc.csrf_token}
-
-            messages_raw = None
-            # Один запрос; пустой ответ = "нет нового" (норма для дельта-режима).
-            # Ошибки HTTP/сети прокинутся выше — их Runner ретраит сам.
-            response = acc.method("post", "runner/", headers, payload, raise_not_200=True)
-            json_response = response.json()
-            data = None
-            for obj in json_response.get("objects") or []:
-                if obj.get("type") == "chat_node":
-                    data = obj.get("data")
-                    break
-            if data is not None and data.get("messages") is not None:
-                messages_raw = data["messages"]
-
-            messages = []
-            prev_author_name, prev_author_id = chat_name, None
-            for m in messages_raw or []:
-                raw_html = m.get("html") or ""
-                soup = BeautifulSoup(raw_html, "html.parser")
-                text, img_link = _parse_msg_html(raw_html)
-                if text and text.startswith(bot_char):
-                    text = text.replace(bot_char, "", 1)  # невидимый префикс бота
-                author_id = int(m.get("author") or 0)
-                author_link = soup.find("a", {"class": "chat-msg-author-link"})
-                if author_link is not None:
-                    author_name = author_link.text  # у сообщения есть "шапка"
-                elif author_id == acc.id:
-                    author_name = acc.username
-                elif prev_author_id == author_id:
-                    author_name = prev_author_name  # продолжение серии сообщений
-                else:
-                    author_name = chat_name if chat_name else str(author_id or "?")
-                prev_author_name, prev_author_id = author_name, author_id
-                messages.append(types.Message(
-                    int(m.get("id") or 0), text, chat_id, chat_name,
-                    author_name, author_id, raw_html, img_link,
-                ))
+            messages, messages_raw = _fetch_chat_node(chat_id, chat_name, last_id)
             if messages_raw:
                 node_last_ids[chat_id] = max(int(m.get("id") or 0) for m in messages_raw)
             result[chat_id] = messages
         return result
+
+    def patched_get_chat_history_full(chat_id: int, chat_name: str | None = None) -> list:
+        """Запрашивает недавнюю историю чата целиком (last_message=-1), не трогая дельта-курсор Runner."""
+        messages, _ = _fetch_chat_node(chat_id, chat_name, -1)
+        return messages
 
     def patched_send_message(chat_id, text=None, chat_name=None, image_id=None,
                              add_to_ignore_list=True, update_last_saved_message=False):
@@ -456,6 +460,7 @@ def patch_account_parsers(acc: Account):
         return message_obj
 
     acc.get_chats_histories = patched_get_chats_histories
+    acc.get_chat_history_full = patched_get_chat_history_full
     acc.send_message = patched_send_message
 
     # --- Патч редактирования лотов: FunPay отдаёт форму лота как HTML,
@@ -549,15 +554,17 @@ def _load_reminders():
             now = time.time()
             reminders_last = {
                 str(k): float(v) for k, v in data.items()
-                if k == "__last_run__" or now - float(v) < 7 * 24 * 3600
+                if str(k).startswith("__") or now - float(v) < 7 * 24 * 3600
             }
     except Exception:
         reminders_last = {}
-    if "ai_enabled" in reminders_last:
-        try:
-            LLM_ENABLED = int(reminders_last["ai_enabled"])
-        except Exception:
-            pass
+    for key in ("__ai_enabled__", "ai_enabled"):
+        if key in reminders_last:
+            try:
+                LLM_ENABLED = 1 if int(reminders_last[key]) else 0
+                break
+            except Exception:
+                pass
 
 
 def _save_reminders():
@@ -1696,8 +1703,11 @@ async def notify_sweep_hit(c, prefix: str = "💬 <b>Новое сообщени
     # (SellNode и т.п.) не уведомляем
     if mtype is enums.MessageTypes.NON_SYSTEM:
         try:
-            hist = await asyncio.to_thread(acc.get_chats_histories, {c.id: c.name})
-            msgs = hist.get(c.id) or []
+            if hasattr(acc, "get_chat_history_full"):
+                msgs = await asyncio.to_thread(acc.get_chat_history_full, c.id, c.name)
+            else:
+                hist = await asyncio.to_thread(acc.get_chats_histories, {c.id: c.name})
+                msgs = hist.get(c.id) or []
             if msgs:
                 last_author = msgs[-1].author_id
                 if last_author == acc.id or last_author in NOTIFY_IGNORE_IDS:
@@ -2242,6 +2252,36 @@ async def show_lots(event=None, edit: bool = False, via_tg: bool = False):
         await tg.send_message(TG_USER_ID, text, buttons=buttons)
 
 
+def _set_ai_enabled(enabled: int):
+    """Переключает AI-автоответчик, сохраняет в reminders.json и отменяет ожидающие задачи при выключении."""
+    global LLM_ENABLED
+    LLM_ENABLED = 1 if enabled else 0
+    reminders_last["__ai_enabled__"] = LLM_ENABLED
+    reminders_last.pop("ai_enabled", None)
+    _save_reminders()
+    if not LLM_ENABLED:
+        for t in list(_ai_pending.values()):
+            if t is not None and not t.done():
+                t.cancel()
+        _ai_pending.clear()
+    log.info("AI-автоответчик %s", "включён" if LLM_ENABLED else "выключен")
+
+
+def _ai_status_payload() -> tuple[str, list]:
+    state = "🟢 включён" if LLM_ENABLED else "🔴 выключен"
+    btn_label = "🔴 Выключить AI" if LLM_ENABLED else "🟢 Включить AI"
+    btn_data = b"ai:0" if LLM_ENABLED else b"ai:1"
+    api_label = "свой API" if LLM_API_KEY else "бесплатный API, без ключей"
+    txt = (
+        f"🤖 AI-автоответчик: <b>{state}</b>\n"
+        f"Модель: <i>{esc(LLM_MODEL)}</i> ({api_label})\n"
+        f"Задержка ответа: {LLM_REPLY_DELAY:.0f} с, кулдаун на чат: {LLM_COOLDOWN:.0f} с\n\n"
+        "Команды: <code>/ai on</code> | <code>/ai off</code> (или кнопка ниже)\n"
+        "<code>/aitest &lt;текст&gt;</code> — проверить ответ нейронки (в песочнице)."
+    )
+    return txt, [[Button.inline(btn_label, btn_data)]]
+
+
 async def on_tg_message(event):
     global pending_price
 
@@ -2312,31 +2352,26 @@ async def on_tg_message(event):
         return
 
     global LLM_ENABLED, _ai_lock
-    if text in ("/ai", "/ai on", "/ai off"):
-        if text == "/ai on":
-            LLM_ENABLED = 1
-            reminders_last["ai_enabled"] = 1
-            _save_reminders()
-            await event.reply("🤖 AI-автоответчик включён.")
+    cmd_parts = text.split()
+    cmd0 = cmd_parts[0].lower().split("@")[0] if cmd_parts else ""
+    cmd_arg = " ".join(cmd_parts[1:]).strip().lower()
+    if cmd0 in ("/ai", "/aioff", "/ai_off", "/aion", "/ai_on"):
+        if cmd0 in ("/aion", "/ai_on") or (cmd0 == "/ai" and cmd_arg in ("on", "1", "true", "вкл", "включить", "start")):
+            _set_ai_enabled(1)
+            msg_txt, msg_btns = _ai_status_payload()
+            await event.reply(f"✅ AI-автоответчик <b>включён</b>.\n\n{msg_txt}", buttons=msg_btns)
             return
-        if text == "/ai off":
-            LLM_ENABLED = 0
-            reminders_last["ai_enabled"] = 0
-            _save_reminders()
-            await event.reply("🤖 AI-автоответчик выключен.")
+        if cmd0 in ("/aioff", "/ai_off") or (cmd0 == "/ai" and cmd_arg in ("off", "0", "false", "выкл", "выключить", "stop", "стоп")):
+            _set_ai_enabled(0)
+            msg_txt, msg_btns = _ai_status_payload()
+            await event.reply(f"🛑 AI-автоответчик <b>выключен</b>.\n\n{msg_txt}", buttons=msg_btns)
             return
-        state = "включён" if LLM_ENABLED else "выключен"
-        await event.reply(
-            f"🤖 AI-автоответчик: <b>{state}</b>\n"
-            f"Модель: <i>{esc(LLM_MODEL)}</i> ({'свой API-ключ' if LLM_API_KEY else 'бесплатный API, без ключей'})\n"
-            f"Задержка ответа: {LLM_REPLY_DELAY:.0f} с, кулдаун на чат: {LLM_COOLDOWN:.0f} с\n\n"
-            "/ai on — включить, /ai off — выключить.\n"
-            "/aitest <текст> — проверить ответ нейронки (в песочнице).\n"
-            "Инструкция нейронки — в .env (LLM_SYSTEM_PROMPT) или в AI_SYSTEM_PROMPT.")
+        msg_txt, msg_btns = _ai_status_payload()
+        await event.reply(msg_txt, buttons=msg_btns)
         return
 
-    if text == "/aitest" or text.startswith("/aitest "):
-        sample = text[7:].strip()
+    if cmd0 == "/aitest":
+        sample = text[len(cmd_parts[0]):].strip()
         if not sample:
             await event.reply(
                 "🧪 <b>Тест нейросети (в песочнице, на FunPay не отправляется)</b>\n\n"
@@ -2798,6 +2833,16 @@ async def on_ban_button(event):
         return
     data = event.data or b""
 
+    if data in (b"ai:0", b"ai:1"):
+        if _is_duplicate_cb(event.id, event.message_id, data):
+            await event.answer()
+            return
+        _set_ai_enabled(1 if data == b"ai:1" else 0)
+        msg_txt, msg_btns = _ai_status_payload()
+        await event.answer("🟢 AI включён" if LLM_ENABLED else "🔴 AI выключен")
+        await safe_edit(event, msg_txt, buttons=msg_btns)
+        return
+
     if data == b"offline:msgs":
         hits, offline_hits[:] = offline_hits[:], []
         if not hits:
@@ -3192,11 +3237,13 @@ async def ai_reply_task(chat_id: int):
     try:
         await asyncio.sleep(LLM_REPLY_DELAY)
         if not LLM_ENABLED:
+            log.info("AI: чат %s пропущен — AI выключен", chat_id)
             return
         if _ai_lock is None:
             _ai_lock = asyncio.Lock()
         async with _ai_lock:
             if not LLM_ENABLED:
+                log.info("AI: чат %s пропущен — AI выключен", chat_id)
                 return
             now_chk = time.time()
             if now_chk < _ai_muted_until.get(chat_id, 0):
@@ -3205,9 +3252,13 @@ async def ai_reply_task(chat_id: int):
             if now_chk - _ai_escalated.get(chat_id, 0) < AI_ESCALATION_PAUSE:
                 log.info("AI: чат %s ждёт ответа продавца (эскалация) — пропускаю", chat_id)
                 return
-            h = await asyncio.to_thread(
-                acc.get_chats_histories, {chat_id: chat_names.get(chat_id)})
-            msgs = h.get(chat_id) or []
+            if hasattr(acc, "get_chat_history_full"):
+                msgs = await asyncio.to_thread(
+                    acc.get_chat_history_full, chat_id, chat_names.get(chat_id))
+            else:
+                h = await asyncio.to_thread(
+                    acc.get_chats_histories, {chat_id: chat_names.get(chat_id)})
+                msgs = h.get(chat_id) or []
             bot_char = getattr(acc, "_Account__bot_character", "⁤")
             last_non_sys = next(
                 (m for m in reversed(msgs)
@@ -3276,6 +3327,7 @@ async def ai_reply_task(chat_id: int):
                     who = getattr(m, "author_name", None) or chat_names.get(chat_id, "покупатель")
                     hist.append({"role": "user", "content": f"{who}: {text}"})
             if not any(item["role"] == "user" for item in hist):
+                log.info("AI: чат %s пропущен — в истории нет сообщений покупателя (msgs=%d)", chat_id, len(msgs))
                 return
 
             need_intro = not any(
@@ -3292,12 +3344,14 @@ async def ai_reply_task(chat_id: int):
             messages = [{"role": "system", "content": sys_prompt}] + hist[-LLM_HISTORY:]
             raw_reply = await asyncio.to_thread(_llm_request, messages)
             if not raw_reply:
+                log.warning("AI: чат %s пропущен — LLM вернула пустой ответ", chat_id)
                 return
             buyer_last = ""
             if last_non_sys is not None and last_non_sys.author_id != acc.id:
                 buyer_last = (last_non_sys.text or "").strip() or "[изображение/скриншот]"
             reply, escalated = _parse_ai_reply(raw_reply, need_intro, buyer_last)
             if not reply:
+                log.warning("AI: чат %s пропущен — ответ отфильтрован (_parse_ai_reply): %.120s", chat_id, raw_reply)
                 return
             last_ours = next((m for m in reversed(msgs) if m.author_id == acc.id), None)
             if last_ours is not None:
@@ -3612,6 +3666,7 @@ async def main():
     acc.get()
     log.info("FunPay аккаунт: id=%s username=%s", acc.id, acc.username)
 
+    await asyncio.to_thread(_load_reminders)
     await asyncio.to_thread(_load_bans)
     if banned_users:
         log.info("Забаненных пользователей: %d", len(banned_users))
